@@ -1,0 +1,42 @@
+[project]
+name = "dblocker"
+version = "0.1.0"
+description = "A Postgres-wire-protocol SQL policy proxy for analytics databases"
+readme = "README.md"
+authors = [
+    { name = "Miguel Paraz", email = "mparaz@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "buenavista[postgres]>=0.4.0",
+    "click>=8.1",
+    "pandas>=2.0",
+    "psycopg[binary]>=3.2",
+    "pyyaml>=6.0",
+    "sqlglot>=25.0",
+]
+
+[project.scripts]
+dblocker = "dblocker.cli:main"
+
+[dependency-groups]
+dev = [
+    "buenavista[duckdb]>=0.4.0",
+    "pytest>=8.0",
+    "ruff>=0.8",
+    "ty>=0.0.1a1",
+]
+
+[build-system]
+requires = ["uv_build>=0.8.17,<0.9.0"]
+build-backend = "uv_build"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

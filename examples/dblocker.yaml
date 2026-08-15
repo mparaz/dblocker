@@ -1,0 +1,49 @@
+# Example dblocker config for a DuckDB downstream reachable over the
+# Postgres wire protocol (e.g. `python -m buenavista.examples.duckdb_postgres`,
+# or another DuckDB pgwire tool such as duckdb-pgwire or duckgres).
+
+listen:
+  host: 0.0.0.0
+  port: 6432
+
+downstream:
+  host: localhost
+  port: 5433
+  user: dblocker
+  dbname: memory
+  # password: set via a secrets manager, not committed to source control
+
+dialect: duckdb
+default_catalog: memory
+default_schema: main
+
+# What happens when a query matches none of the rules below.
+default_action: allow
+
+rules:
+  # Only allow queries that touch the "analytics" schema. Any table
+  # reference (qualified or not, resolved against the session's current
+  # catalog/schema) outside this schema is denied.
+  - name: restrict-to-analytics-schema
+    type: schema_allowlist
+    action: deny
+    schemas: ["analytics", "main"]
+
+  # Block schema-modifying statements outright, regardless of table.
+  - name: block-ddl
+    type: statement_type_block
+    action: deny
+    statement_types: ["drop", "truncatetable", "alter", "create"]
+
+  # Deny access to specific tables by glob pattern over catalog.schema.table.
+  - name: block-scratch-tables
+    type: table_denylist
+    action: deny
+    tables: ["*.*.tmp_*", "*.*.scratch_*"]
+
+  # Catch-all pattern block for things the AST-based rules above don't model
+  # well, e.g. references to system catalogs.
+  - name: block-system-catalog-access
+    type: regex
+    action: deny
+    pattern: "(?i)pg_catalog\\.|information_schema\\."
