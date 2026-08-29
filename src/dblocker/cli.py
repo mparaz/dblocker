@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import logging
+import sys
 
 import click
 
-from dblocker.config import load_config
-from dblocker.server import serve
+from dblocker.core.config import ConfigError, load_config
+from dblocker.pgwire.server import serve
 
 
 @click.command()
@@ -30,8 +31,16 @@ def main(config_path: str, log_level: str) -> None:
         level=getattr(logging, log_level.upper()),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    config = load_config(config_path)
-    serve(config)
+    try:
+        config = load_config(config_path)
+    except ConfigError as exc:
+        # A misread config is a security-relevant failure, so refuse to start
+        # rather than falling back to some default posture.
+        raise SystemExit(f"dblocker: invalid configuration: {exc}") from exc
+    try:
+        serve(config)
+    except KeyboardInterrupt:
+        print("dblocker: shutting down", file=sys.stderr)
 
 
 if __name__ == "__main__":
