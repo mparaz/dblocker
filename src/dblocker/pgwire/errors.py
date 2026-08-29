@@ -19,6 +19,9 @@ from dblocker.core.decision import SQLSTATE_INSUFFICIENT_PRIVILEGE
 
 # internal_error: dblocker could not establish what a statement would do.
 SQLSTATE_INTERNAL_ERROR = "XX000"
+# io_error: provenance could not be written, so the query was refused. Distinct
+# from insufficient_privilege because this one is worth retrying unchanged.
+SQLSTATE_LEDGER_UNAVAILABLE = "58030"
 
 
 class PolicyViolation(Exception):

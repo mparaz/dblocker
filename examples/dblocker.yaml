@@ -99,3 +99,16 @@ rules:
     action: allow
     match:
       statement_class: [context]
+
+evidence:
+  # Provenance for every decision. Records carry hashes and counts; the SQL
+  # text they refer to lives in the separate, owner-readable store below, and
+  # result rows are never written anywhere.
+  enabled: true
+  ledger_path: ../var/dblocker/ledger.jsonl
+  sql_store_path: ../var/dblocker/sql
+  result_digest: true
+  # If provenance cannot be written, refuse the query rather than run one
+  # nobody can later account for.
+  on_write_failure: deny
+  ring_buffer_size: 1000

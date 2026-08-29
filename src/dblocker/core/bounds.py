@@ -15,7 +15,9 @@ limit only ever bounded what was *sent* to the client, not what was *fetched*.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+import hashlib
+import json
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from typing import Any
 
@@ -68,30 +70,66 @@ def _existing_limit(tree: exp.Query) -> int | None:
 
 @dataclass
 class BoundedStream:
-    """Iterates a cursor's rows, stopping at the row or byte cap."""
+    """Iterates a cursor's rows, stopping at the row or byte cap.
+
+    Optionally maintains a running digest of the rows as they pass. That digest
+    lets a reviewer check that a figure an agent reported came from a recorded
+    execution, without the figure itself ever being stored. Note what it does
+    and does not identify: SQL without ORDER BY has no guaranteed row order, so
+    the digest identifies *what this execution returned*, not a stable
+    fingerprint of the query's answer.
+    """
 
     max_rows: int
     max_bytes: int
     batch_size: int = 1_000
+    digest_rows: bool = False
+    on_complete: Callable[[BoundedStream], None] | None = None
     row_count: int = 0
     byte_count: int = 0
     truncated: bool = False
+    finalized: bool = False
+    _hasher: Any = None
+
+    def __post_init__(self) -> None:
+        if self.digest_rows:
+            self._hasher = hashlib.sha256()
 
     def rows(self, cursor: Any) -> Iterator[list]:
-        while True:
-            batch = cursor.fetchmany(self.batch_size)
-            if not batch:
-                return
-            for row in batch:
-                if self.max_rows > 0 and self.row_count >= self.max_rows:
-                    self.truncated = True
+        try:
+            while True:
+                batch = cursor.fetchmany(self.batch_size)
+                if not batch:
                     return
-                if self.max_bytes > 0 and self.byte_count >= self.max_bytes:
-                    self.truncated = True
-                    return
-                self.row_count += 1
-                self.byte_count += _estimate_bytes(row)
-                yield list(row)
+                for row in batch:
+                    if self.max_rows > 0 and self.row_count >= self.max_rows:
+                        self.truncated = True
+                        return
+                    if self.max_bytes > 0 and self.byte_count >= self.max_bytes:
+                        self.truncated = True
+                        return
+                    self.row_count += 1
+                    self.byte_count += _estimate_bytes(row)
+                    if self._hasher is not None:
+                        self._hasher.update(_canonical_row(row))
+                    yield list(row)
+        finally:
+            # Runs on exhaustion and on early close alike -- a client that
+            # disconnects mid-result throws GeneratorExit in here, so the
+            # outcome is still recorded rather than silently lost.
+            self.finalize()
+
+    def finalize(self) -> None:
+        """Idempotent: the completion callback fires exactly once."""
+        if self.finalized:
+            return
+        self.finalized = True
+        if self.on_complete is not None:
+            self.on_complete(self)
+
+    @property
+    def result_sha256(self) -> str | None:
+        return self._hasher.hexdigest() if self._hasher is not None else None
 
     def summary(self) -> dict[str, Any]:
         """Bounded facts about the result -- shape and size, never values."""
@@ -99,7 +137,17 @@ class BoundedStream:
             "row_count": self.row_count,
             "byte_count": self.byte_count,
             "truncated": self.truncated,
+            "result_sha256": self.result_sha256,
         }
+
+
+def _canonical_row(row: Any) -> bytes:
+    """Length-prefixed compact JSON, so digests cannot collide across rows.
+
+    Without the prefix, rows ["a","b"] and ["ab"] could hash identically.
+    """
+    encoded = json.dumps(list(row), default=str, separators=(",", ":")).encode("utf-8")
+    return len(encoded).to_bytes(8, "big") + encoded
 
 
 def _estimate_bytes(row: Any) -> int:

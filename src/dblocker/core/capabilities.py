@@ -34,16 +34,25 @@ class CapabilityError(ValueError):
 
 
 @dataclass(frozen=True)
+class DblockerCall:
+    """An in-band call to a `dblocker.<func>(...)` relation."""
+
+    func: str
+    args: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class CapabilityCall:
     name: str
     args: tuple[str, ...]
 
 
-def parse_capability_call(sql: str, *, dialect: str) -> CapabilityCall | None:
-    """Recognise `SELECT ... FROM dblocker.capability('name', ...)`.
+def parse_dblocker_call(sql: str, *, dialect: str) -> DblockerCall | None:
+    """Recognise `SELECT ... FROM dblocker.<func>(...)`.
 
-    Returns None for anything that is not such a call, so ordinary SQL falls
-    through untouched.
+    One parser serves both the capability registry and the introspection
+    relations. Returns None for anything that is not such a call, so ordinary
+    SQL falls through untouched.
     """
     try:
         tree = sqlglot.parse_one(sql, dialect=dialect)
@@ -62,17 +71,25 @@ def parse_capability_call(sql: str, *, dialect: str) -> CapabilityCall | None:
     if (table.db or "").lower() != "dblocker":
         return None
     func = table.this
-    if not isinstance(func, exp.Anonymous) or str(func.this).lower() != "capability":
+    if not isinstance(func, exp.Anonymous):
         return None
 
     args: list[str] = []
     for argument in func.expressions:
         if not isinstance(argument, exp.Literal):
-            raise CapabilityError("capability arguments must be literals")
+            raise CapabilityError("dblocker.* arguments must be literals")
         args.append(str(argument.this))
-    if not args:
+    return DblockerCall(func=str(func.this).lower(), args=tuple(args))
+
+
+def parse_capability_call(sql: str, *, dialect: str) -> CapabilityCall | None:
+    """Recognise `SELECT ... FROM dblocker.capability('name', ...)`."""
+    call = parse_dblocker_call(sql, dialect=dialect)
+    if call is None or call.func != "capability":
+        return None
+    if not call.args:
         raise CapabilityError("dblocker.capability() needs a capability name")
-    return CapabilityCall(name=args[0].lower(), args=tuple(args[1:]))
+    return CapabilityCall(name=call.args[0].lower(), args=call.args[1:])
 
 
 def _qualified(target: str, context: SessionContext) -> exp.Table:

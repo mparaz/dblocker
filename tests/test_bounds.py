@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from dblocker.core.bounds import BoundedStream, apply_row_limit
@@ -82,10 +84,68 @@ def test_stream_under_the_cap_is_not_truncated():
     rows = list(stream.rows(FakeCursor([(i,) for i in range(7)])))
     assert len(rows) == 7
     assert not stream.truncated
-    assert stream.summary() == {"row_count": 7, "byte_count": stream.byte_count, "truncated": False}
+    assert stream.summary() == {
+        "row_count": 7,
+        "byte_count": stream.byte_count,
+        "truncated": False,
+        "result_sha256": None,
+    }
 
 
 def test_summary_reports_shape_not_values():
-    stream = BoundedStream(max_rows=10, max_bytes=0)
+    stream = BoundedStream(max_rows=10, max_bytes=0, digest_rows=True)
     list(stream.rows(FakeCursor([("secret-value",)])))
-    assert set(stream.summary()) == {"row_count", "byte_count", "truncated"}
+    summary = stream.summary()
+    assert set(summary) == {"row_count", "byte_count", "truncated", "result_sha256"}
+    # The digest attests to the rows without carrying them.
+    assert "secret-value" not in json.dumps(summary)
+
+
+def test_digest_is_deterministic_for_the_same_rows():
+    rows = [(1, "a"), (2, "b"), (3, None)]
+
+    def digest_of(data):
+        stream = BoundedStream(max_rows=0, max_bytes=0, digest_rows=True)
+        list(stream.rows(FakeCursor(data)))
+        return stream.result_sha256
+
+    assert digest_of(rows) == digest_of(list(rows))
+    assert digest_of(rows) != digest_of(rows[::-1]), "row order must change the digest"
+    assert digest_of(rows) != digest_of(rows[:2])
+
+
+def test_digest_cannot_collide_across_row_boundaries():
+    """Length-prefixing means [('a','b')] and [('ab',)] hash differently."""
+
+    def digest_of(data):
+        stream = BoundedStream(max_rows=0, max_bytes=0, digest_rows=True)
+        list(stream.rows(FakeCursor(data)))
+        return stream.result_sha256
+
+    assert digest_of([("a", "b")]) != digest_of([("ab",)])
+
+
+def test_digest_is_absent_unless_requested():
+    stream = BoundedStream(max_rows=10, max_bytes=0)
+    list(stream.rows(FakeCursor([(1,)])))
+    assert stream.result_sha256 is None
+
+
+def test_completion_callback_fires_once_on_exhaustion():
+    seen = []
+    stream = BoundedStream(max_rows=0, max_bytes=0, on_complete=seen.append)
+    list(stream.rows(FakeCursor([(1,), (2,)])))
+    assert len(seen) == 1 and seen[0] is stream
+    stream.finalize()  # idempotent
+    assert len(seen) == 1
+
+
+def test_completion_callback_fires_when_the_client_stops_early():
+    """A client that disconnects mid-result must still produce an outcome."""
+    seen = []
+    stream = BoundedStream(max_rows=0, max_bytes=0, on_complete=seen.append)
+    generator = stream.rows(FakeCursor([(i,) for i in range(100)]))
+    next(generator)
+    generator.close()
+    assert len(seen) == 1
+    assert stream.row_count == 1

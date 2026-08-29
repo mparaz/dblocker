@@ -12,8 +12,10 @@ from typing import Any
 import yaml
 
 from dblocker.core.classify import StatementClass
+from dblocker.core.evidence import EvidenceConfig
 
 VALID_ACTIONS = {"allow", "deny"}
+VALID_WRITE_FAILURE_MODES = {"deny", "continue"}
 
 # Session settings a Postgres client may set during its own handshake. These
 # are cosmetic or protocol-level and do not change which data is reachable, so
@@ -183,6 +185,7 @@ class Config:
     auth: AuthConfig = field(default_factory=AuthConfig)
     context: ContextConfig = field(default_factory=ContextConfig)
     limits: LimitsConfig = field(default_factory=LimitsConfig)
+    evidence: EvidenceConfig = field(default_factory=EvidenceConfig)
     dialect: str = "duckdb"
     default_action: str = "deny"
     allow_permissive_default: bool = False
@@ -191,6 +194,11 @@ class Config:
     policy_sha256: str = ""
 
     def __post_init__(self) -> None:
+        if self.evidence.on_write_failure not in VALID_WRITE_FAILURE_MODES:
+            raise ConfigError(
+                "evidence.on_write_failure must be 'deny' or 'continue', "
+                f"got {self.evidence.on_write_failure!r}"
+            )
         if self.default_action not in VALID_ACTIONS:
             raise ConfigError(
                 f"default_action must be 'allow' or 'deny', got {self.default_action!r}"
@@ -247,8 +255,28 @@ def _build_auth(raw: Any) -> AuthConfig:
     return AuthConfig(required=raw.get("required", True), users=users)
 
 
+def _build_evidence(raw: Any, config_path: Path) -> EvidenceConfig:
+    raw = raw or {}
+    known = set(EvidenceConfig.__dataclass_fields__)
+    unknown = set(raw) - known
+    if unknown:
+        raise ConfigError(
+            f"unknown evidence setting(s) {sorted(unknown)}; valid settings are {sorted(known)}"
+        )
+    values = dict(raw)
+    # Relative store paths resolve against the config file, not the working
+    # directory, so where dblocker is launched from cannot silently move the
+    # ledger somewhere new.
+    for key in ("ledger_path", "sql_store_path"):
+        if key in values:
+            path = Path(values[key])
+            values[key] = path if path.is_absolute() else config_path.parent / path
+    return EvidenceConfig(**values)
+
+
 def load_config(path: str | Path) -> Config:
-    text = Path(path).read_text()
+    config_path = Path(path).resolve()
+    text = config_path.read_text()
     data = yaml.safe_load(text) or {}
     if not isinstance(data, dict):
         raise ConfigError("config file must contain a YAML mapping at the top level")
@@ -261,6 +289,7 @@ def load_config(path: str | Path) -> Config:
         auth=_build_auth(data.get("auth")),
         context=ContextConfig(**data.get("context", {})),
         limits=LimitsConfig(**data.get("limits", {})),
+        evidence=_build_evidence(data.get("evidence"), config_path),
         dialect=data.get("dialect", "duckdb"),
         default_action=data.get("default_action", "deny"),
         allow_permissive_default=data.get("allow_permissive_default", False),

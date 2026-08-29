@@ -9,13 +9,20 @@ classified with [sqlglot](https://github.com/tobymao/sqlglot), checked against
 a policy, and either forwarded under explicit limits or refused with a proper
 Postgres error, before it reaches the database.
 
+There are two front-ends over one core: the **Postgres wire protocol**, so
+psql, dbt and BI tools work unchanged, and an **MCP server**, so an agent gets
+every result back with the provenance of the execution that produced it.
+
 ## What it does and does not establish
 
 dblocker establishes **what was executed, under which policy, against which
-pinned context, and how much came back**. It does not establish that an
-agent's *interpretation* of the rows is correct — a query can be permitted,
-bounded, recorded, and still be reasoned about wrongly. Consequential
-conclusions still need human judgement.
+pinned context, and what shape of result came back** — durably, in an
+append-only ledger, with a digest that ties a reported figure to a recorded
+execution.
+
+It does not establish that an agent's *interpretation* of the rows is correct.
+A query can be permitted, bounded, recorded, digested, and still be reasoned
+about wrongly. Consequential conclusions still need human judgement.
 
 It is also only a control if the agent cannot reach the database directly.
 dblocker should hold the downstream credentials, and the downstream role
@@ -82,10 +89,67 @@ extra reach: the rendered SQL goes back through the same policy, so
 and a detail field naming the matched rule, so an agent can tell "policy
 refused this" from "this SQL is invalid" without matching on message text.
 
-**Bounded audit records.** Each decision is logged as JSON carrying a
-`sql_sha256` rather than the statement text, plus the context hash, the policy
-hash, the statement classes and the tables touched. Result rows are never
-recorded.
+## Evidence
+
+Every query produces provenance in an append-only JSONL ledger: a `decision`
+record written *before* execution, then an `outcome` record when the result
+finishes streaming. Both share a `query_id`. A refusal writes one terminal
+record and never touches the database.
+
+The ledger carries hashes and counts. **The SQL text lives in a separate
+content-addressed store**, owner-readable only, referenced by hash. That split
+is the point: the ledger can be shipped to a reviewer or a pipeline while the
+statement text stays with whoever ran it.
+
+Never recorded: SQL text, result values, or downstream error *messages* — an
+`error_class` is stored instead, because Postgres error text can quote row
+values.
+
+**Result digests.** Rows are hashed as they stream past, so a reviewer can
+check that a figure an agent reported came from a recorded execution without
+the figure ever being stored. Note precisely what this identifies: SQL without
+`ORDER BY` has no guaranteed row order, so the digest identifies *what this
+execution returned*, not a stable fingerprint of the query's answer.
+
+**Truncation is reported honestly.** A result can be cut two ways — the stream
+hits its cap, or dblocker's injected `LIMIT` stops the downstream first. The
+second looks complete from the inside, so it is corrected explicitly:
+`row_limit_applied` records that dblocker imposed a bound, and a result coming
+back at exactly the cap is marked `truncated` rather than claimed whole.
+
+**Fail closed, with one honest asymmetry.** If a decision cannot be written,
+the query is refused (SQLSTATE `58030`) — an unrecorded query is worse than a
+refused one. An *outcome* write failure cannot rescind a query whose rows are
+already on the wire; it marks the ledger degraded, and queries are refused from
+that point until it recovers. dblocker does not pretend the last one was atomic.
+
+Read it back in-band: `SELECT * FROM dblocker.context()`,
+`dblocker.queries('20')`, `dblocker.query('<id>')`, `dblocker.capabilities()`.
+None of these reach the downstream.
+
+## MCP
+
+```bash
+uv run dblocker mcp --config examples/dblocker.yaml   # stdio
+```
+
+Tools: `context_info`, `list_capabilities`, `capability`, `query`,
+`recent_queries`, `query_record`.
+
+A wire protocol has nowhere to put an evidence identifier — a result set is
+just rows. An MCP tool returns a structured object, so every data result
+arrives with its own envelope:
+
+```json
+{"columns": ["id","name"], "rows": [[1,"alpha"]],
+ "evidence": {"query_id": "01a04d98...", "context_hash": "1941f776...",
+              "policy_sha256": "2eb62e7b...", "sql_sha256": "3ec45f64...",
+              "row_count": 1, "truncated": false, "result_sha256": "a8c4e24d..."}}
+```
+
+That is what lets an agent cite its evidence rather than merely have some.
+Refusals come back as structured errors naming the rule, the reason and the
+`query_id`.
 
 ## Rules
 
@@ -121,7 +185,7 @@ uv sync
 uv run --group dev python -m buenavista.examples.duckdb_postgres
 
 # dblocker in front of it, enforcing examples/dblocker.yaml.
-uv run dblocker --config examples/dblocker.yaml
+uv run dblocker serve --config examples/dblocker.yaml
 
 psql -h 127.0.0.1 -p 6432 -d memory
 ```
@@ -152,15 +216,16 @@ uv run ty check src
 uv run pytest
 ```
 
-`tests/test_bypass_corpus.py` holds every statement that defeated the earlier
-table-based allowlist, each asserted denied. New evasion routes belong there
+`tests/corpus.py` holds every statement that defeated the earlier table-based
+allowlist. It is asserted denied three times over: against the policy engine,
+through the whole engine path, and over MCP. New evasion routes belong there
 first.
 
-## Not yet built
+## Deliberately not built
 
-A durable evidence layer: an append-only JSONL ledger of provenance
-(`query_id`, context hash, SQL hash, policy hash, timestamps, row/byte counts,
-result digest, lifecycle status) with raw SQL kept in a separate
-content-addressed owner-readable store, so records can be shared while the
-statement text stays put. The decision records and canonical SQL that layer
-needs are already produced; nothing persists them yet.
+**Result pagination and resume.** The tool this is modelled on can offer it
+because the warehouse retains results server-side by query id. dblocker retains
+no rows at all, so reproducing it would mean adding a result cache — which
+would defeat the data minimisation that makes the ledger safe to share. The
+result digest exists instead: it attests to what an execution returned without
+keeping it.
