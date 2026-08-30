@@ -1,49 +1,114 @@
-# Example dblocker config for a DuckDB downstream reachable over the
-# Postgres wire protocol (e.g. `python -m buenavista.examples.duckdb_postgres`,
-# or another DuckDB pgwire tool such as duckdb-pgwire or duckgres).
+# Example dblocker policy: a read-only analyst view of one schema.
+#
+# The posture is deny-by-default. Anything not positively matched by an allow
+# rule below is refused, including statements dblocker cannot parse and
+# statements that reach data without naming a table (ATTACH, COPY ... TO,
+# INSTALL/LOAD, read_csv/read_parquet, ...). Widening access means adding an
+# allow rule, never removing a deny rule.
 
 listen:
-  host: 0.0.0.0
+  host: 127.0.0.1
   port: 6432
 
 downstream:
+  # A Postgres-wire-compatible endpoint in front of DuckDB, e.g.
+  # `python -m buenavista.examples.duckdb_postgres`.
   host: localhost
   port: 5433
   user: dblocker
   dbname: memory
-  # password: set via a secrets manager, not committed to source control
+  # Never inline a password; name the environment variable holding it.
+  # password_env: DBLOCKER_DOWNSTREAM_PASSWORD
+
+auth:
+  # Loopback-only listeners may run without auth. Binding to any other
+  # interface requires auth.users to be configured.
+  required: false
 
 dialect: duckdb
-default_catalog: memory
-default_schema: main
 
-# What happens when a query matches none of the rules below.
-default_action: allow
+context:
+  # The effective catalog/schema unqualified table names resolve against.
+  # dblocker pins this and re-applies it on every pooled connection checkout,
+  # so its view of the session cannot drift from the downstream's.
+  catalog: memory
+  schema: analytics
+  # USE / SET schema / SET search_path would desynchronise that view, so they
+  # are refused. Cosmetic client-handshake settings stay allowed; see
+  # DEFAULT_SESSION_SETTINGS_ALLOWLIST in dblocker.core.config.
+  allow_context_switch: false
+
+limits:
+  max_rows: 10000
+  max_bytes: 33554432
+  statement_timeout_ms: 30000
+  single_statement_only: true
+
+capabilities:
+  # Named canonical queries dblocker generates itself, so an agent can
+  # investigate structure without composing its own SQL.
+  enabled:
+    - list_schemas
+    - list_tables
+    - describe_table
+    - table_row_count
+    - column_stats
+    - row_sample
+
+default_action: deny
 
 rules:
-  # Only allow queries that touch the "analytics" schema. Any table
-  # reference (qualified or not, resolved against the session's current
-  # catalog/schema) outside this schema is denied.
-  - name: restrict-to-analytics-schema
-    type: schema_allowlist
-    action: deny
-    schemas: ["analytics", "main"]
+  # Reads confined to the analytics schema, and only against real tables --
+  # `reads_external_files: false` is what stops read_csv_auto('/etc/passwd')
+  # and friends from qualifying as ordinary reads.
+  - name: allow-analytics-reads
+    action: allow
+    match:
+      statement_class: [read]
+      all_tables_in:
+        catalogs: [memory]
+        schemas: [analytics]
+      reads_external_files: false
 
-  # Block schema-modifying statements outright, regardless of table.
-  - name: block-ddl
-    type: statement_type_block
-    action: deny
-    statement_types: ["drop", "truncatetable", "alter", "create"]
+  # Catalog metadata reads, but only when dblocker generated them itself from
+  # a capability template. Scoped to information_schema on purpose: the
+  # capabilities that touch real tables (table_row_count, column_stats,
+  # row_sample) are deliberately NOT covered here, so they fall through to
+  # allow-analytics-reads above and inherit its schema allowlist. Naming a
+  # capability must never widen reach.
+  - name: allow-capability-metadata
+    action: allow
+    match:
+      statement_class: [read]
+      capability:
+        - list_schemas
+        - list_tables
+        - describe_table
+      all_tables_in:
+        schemas: [information_schema]
 
-  # Deny access to specific tables by glob pattern over catalog.schema.table.
-  - name: block-scratch-tables
-    type: table_denylist
-    action: deny
-    tables: ["*.*.tmp_*", "*.*.scratch_*"]
+  # Drivers open and close transactions on their own; refusing these breaks
+  # ordinary clients without withholding any data.
+  - name: allow-transaction-control
+    action: allow
+    match:
+      statement_class: [transaction]
 
-  # Catch-all pattern block for things the AST-based rules above don't model
-  # well, e.g. references to system catalogs.
-  - name: block-system-catalog-access
-    type: regex
-    action: deny
-    pattern: "(?i)pg_catalog\\.|information_schema\\."
+  # Cosmetic session settings sent during a client's connection handshake.
+  - name: allow-client-handshake-settings
+    action: allow
+    match:
+      statement_class: [context]
+
+evidence:
+  # Provenance for every decision. Records carry hashes and counts; the SQL
+  # text they refer to lives in the separate, owner-readable store below, and
+  # result rows are never written anywhere.
+  enabled: true
+  ledger_path: ../var/dblocker/ledger.jsonl
+  sql_store_path: ../var/dblocker/sql
+  result_digest: true
+  # If provenance cannot be written, refuse the query rather than run one
+  # nobody can later account for.
+  on_write_failure: deny
+  ring_buffer_size: 1000
